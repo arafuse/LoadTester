@@ -261,7 +261,7 @@ class Requester(threading.Thread):
                     self.info += '\n  Got 200 response at {:+.5f}s'.format(elapsed_time)
                     self.data.extend([200, elapsed_time])
                 
-                elif ((self.status  >= 500 and self.status <= 599) or (self.status in [400, 408, 429])):
+                elif ((self.status  >= 500 and self.status <= 599) or (self.status in [408, 429])):
                     elapsed_time = time.time() - start_time
                     self.info += '\n  Retrying for status {} at {:+.5f}s'.format(self.status, elapsed_time)
                     self.data.extend([self.status, elapsed_time])                    
