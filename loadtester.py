@@ -253,7 +253,8 @@ class Requester(threading.Thread):
                                          
         while self.status != 200:
             try:                            
-                response = self.session.request(method, url, timeout=self.config['timeout'], stream=True)
+                response = self.session.request(method, url, timeout=self.config['timeout'], params=params, 
+                                                stream=True)
                 self.status = response.status_code 
                 
                 if (self.status == 200):
