@@ -26,6 +26,7 @@ import requests
 # Application defaults.
 NUM_WORKERS = 5000                               # Total number test workers
 NUM_PROCESSES = multiprocessing.cpu_count() + 1  # Number of processes (cores) to utilize
+THREAD_SLEEP = 0.1
 
 # Global timer used by each process.
 global_timer = time.time()
@@ -111,7 +112,8 @@ class Dispatcher(multiprocessing.Process):
         
         # Kick off all worker threads, which will wait before making any requests.
         start_workers = threading.Event()
-        workers = [ Requester(i, start_workers, threads_completed, self.config) for i in range(self.num_workers)]
+        workers = [ Requester(num, start_workers, threads_completed, self.config)
+                    for num in range(self.num_workers)]
         for i in range(self.num_workers):
             workers[i].start()
             self.output.put("Process {} initialized worker {}".format(self.process_id, i))
@@ -127,13 +129,23 @@ class Dispatcher(multiprocessing.Process):
         global_timer = time.time()
         start_workers.set()
                         
-        # Report each completed worker status back to the calling process as it comes in.
+        # Join on the queue of completed worker statuses while aggregating the data from them in order.
         worker_count = self.num_workers
         while (worker_count):
-            worker_id = threads_completed.get(block=True)
-            self.output.put('Process {}, {}'.format(self.process_id, workers[worker_id].info))
-            self.data.put(workers[worker_id].data)
-            worker_count -= 1
+            try:
+                worker_id = threads_completed.get()                
+                worker_count -= 1
+                
+                # Set a globally unique id for each worker based on process id.                                          
+                workers[worker_id].data[0] = (workers[worker_id].data[0] + 1) * (self.process_id + 1) - 1
+                                
+                # Send output and data back to the calling process.
+                self.output.put('Process {}, {}'.format(self.process_id, workers[worker_id].info))
+                self.data.put(workers[worker_id].data)
+                
+            except queue.Empty:                
+                time.sleep(THREAD_SLEEP)
+                
         self.output.put(None)
                   
 class Requester(threading.Thread):
