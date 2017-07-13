@@ -18,6 +18,7 @@ import time
 import queue
 import random
 import copy
+import signal
 import multiprocessing
 
 sys.path.insert(0, 'lib/')
@@ -31,68 +32,86 @@ THREAD_SLEEP = 0.1
 # Global timer used by each process.
 global_timer = time.time()
 
-def main(config_filename, num_workers, num_processes, output_filename, output_format):
-    start_load_test = multiprocessing.Event()
-    process_output = multiprocessing.Queue()
-    process_data = multiprocessing.Queue()                        
-    output_file = open(output_filename, 'w') if output_filename is not None else None
-            
-    # Load and output configuration data.
-    with open(config_filename) as config_file:
-        config = json.load(config_file)        
-    print(json.dumps(config))
-    if output_file is not None and output_format is None:
-        output_file.write(json.dumps(config) + '\n')
-            
-    # Spawn load test processes.
-    processes = [ Dispatcher(num, start_load_test, process_output, process_data, config,
-                             num_workers // num_processes) for num in range(num_processes) ] 
-    
-    # Start each process which will stand by once they've kicked up all their workers.   
-    for process in processes:
-        process.start()       
-    join_and_output(num_processes, process_output, output_file if output_format is None else None)
-    
-    # Unleash the damage.
-    start_load_test.set()
-    join_and_output(num_processes, process_output, output_file if output_format is None else None)
-    
-    # Output CSV from worker data if requested.
-    if output_format == 'csv':
-        output_csv(process_data, output_file)
-            
-    # Close output file if specified.
-    if output_file is not None:
-        output_file.close()        
+class Application(object):    
+    @classmethod
+    def init(cls, config_filename, num_workers, num_processes, output_filename, output_format):
+        cls.config_filename = config_filename
+        cls.num_workers = num_workers
+        cls.num_processes = num_processes
+        cls.output_filename = output_filename
+        cls.output_format = output_format
+        
+        cls.start_load_test = multiprocessing.Event()
+        cls.interrupted = multiprocessing.Event()
+        cls.process_output = multiprocessing.Queue()
+        cls.process_data = multiprocessing.Queue()                        
+        cls.output_file = open(output_filename, 'w') if output_filename is not None else None
+                
+        with open(cls.config_filename) as config_file:
+            cls.config = json.load(config_file)  
+               
+    @classmethod 
+    def start(cls): 
+        # Output configuration info.                                                                      
+        print(json.dumps(cls.config))
+        if cls.output_file is not None and cls.output_format is None:
+            cls.output_file.write(json.dumps(cls.config) + '\n')
+                
+        # Spawn load test processes.
+        processes = [ Dispatcher(num, cls.start_load_test, cls.process_output, cls.process_data, cls.config,
+                                 cls.num_workers // cls.num_processes) for num in range(cls.num_processes) ] 
+        
+        # Start each process which will stand by once they've kicked up all their workers.   
+        for process in processes:
+            process.start()       
+        cls.join_and_output(cls.num_processes,
+                             cls.process_output,
+                             cls.output_file if cls.output_format is None else None)
+        
+        # Unleash the damage.
+        cls.start_load_test.set()
+        cls.join_and_output(cls.num_processes, 
+                             cls.process_output, 
+                             cls.output_file if cls.output_format is None else None)
+        
+        # Output CSV from worker data if requested.
+        if cls.output_format == 'csv':
+            cls.output_csv(cls.process_data, cls.output_file)
+                
+        # Close output file if specified.
+        if cls.output_file is not None:
+            cls.output_file.close()        
 
-def join_and_output(num, queue, output_file):
-    """
-    Joins on a queue while directing output from it. The queue is assumed to be filled by 'num' threads / processes
-    and interprets 'None' in the queue as a signal from one of the threads / processes that it has completed. Will
-    print to standard output and optionally write to 'out_file' file object if it is not 'None'.
-    """
-    count = num
-    while count:
-        output = queue.get(block=True)
-        if output is None:
-            count -= 1
-        else:
-            print(output)
-            if output_file is not None:
-                output_file.write(output + "\n")
+    @classmethod
+    def join_and_output(cls, num, queue, output_file):
+        """
+        Joins on a queue while directing output from it. The queue is assumed to be filled by 'num' threads / processes
+        and interprets 'None' in the queue as a signal from one of the threads / processes that it has completed. Will
+        print to standard output and optionally write to 'out_file' file object if it is not 'None'.
+        """
+        count = num
+        while count:
+            output = queue.get(block=True)
+            if output is None:
+                count -= 1
+            else:
+                print(output)
+                if output_file is not None:
+                    output_file.write(output + "\n")
     
-def output_csv(queue, output_file):
-    """
-    Outputs data from a queue to a file object in CSV format. Each queue entry is expected to contain a list of
-    primitives.     
-    """
-    while not queue.empty():
-        data = queue.get()
-        output_file.write(str(data[0]))
-        for element in data[1:]:
-            output_file.write(',' + str(element))
-        output_file.write('\n')
-    
+    @classmethod
+    def output_csv(cls, queue, output_file):
+        """
+        Outputs data from a queue to a file object in CSV format. Each queue entry is expected to contain a list of
+        primitives.     
+        """
+        while not queue.empty():
+            data = queue.get()
+            output_file.write(str(data[0]))
+            for element in data[1:]:
+                output_file.write(',' + str(element))
+            output_file.write('\n')
+        
 class Dispatcher(multiprocessing.Process):
     """
     Process which controls execution of Requester threads.
@@ -244,8 +263,9 @@ if __name__ == '__main__':
     if not (os.path.isfile(args.config)):
         sys.stderr.write("Configuration file '{}' not found.\n\n".format(args.output))
 
-    main(args.config,
-         args.workers if args.workers else NUM_WORKERS,
-         args.processes if args.processes else NUM_PROCESSES,
-         args.output if args.output else None,
-         args.format.lower() if args.format else None)
+    Application.init(args.config,
+                     args.workers if args.workers else NUM_WORKERS,
+                     args.processes if args.processes else NUM_PROCESSES,
+                     args.output if args.output else None,
+                     args.format.lower() if args.format else None)
+    Application.start()
