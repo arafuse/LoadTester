@@ -1,0 +1,12 @@
+{
+  "url": "https://jsonplaceholder.typicode.com/posts",
+  "method": "GET",
+  "timeout": 10,
+  "randomize": [["arg1", "arg2"]],
+  "params":
+  {
+      "arg1": ["test1", "test2", "test3"],
+      "arg2": ["test4", "test5", "test6"],
+      "arg3": "test6"
+   }
+}
