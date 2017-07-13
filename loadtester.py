@@ -27,100 +27,127 @@ import requests
 # Application defaults.
 NUM_WORKERS = 5000                               # Total number test workers
 NUM_PROCESSES = multiprocessing.cpu_count() + 1  # Number of processes (cores) to utilize
-THREAD_SLEEP = 0.1
+THREAD_SLEEP = 0.1                               # Default time to sleep a thread (eg. during polling)
+MAX_INTERRUPTS = 5                               # Max Ctrl+C / SIGINTs before hard exit
 
 # Global timer used by each process.
 global_timer = time.time()
 
-class Application(object):    
-    @classmethod
-    def init(cls, config_filename, num_workers, num_processes, output_filename, output_format):
-        cls.config_filename = config_filename
-        cls.num_workers = num_workers
-        cls.num_processes = num_processes
-        cls.output_filename = output_filename
-        cls.output_format = output_format
+class Singleton():
+    """
+    Allows singleton classes with nicer syntax through inheritance.
+    """
+    _shared_state = {}
+    def __init__(self):
+        self.__dict__ = self._shared_state
+
+class Application(Singleton):
+    """
+    Main application logic.
+    """
+    def __init__(self, config_filename, num_workers, num_processes, output_filename, output_format):
+        Singleton.__init__(self)
         
-        cls.start_load_test = multiprocessing.Event()
-        cls.interrupted = multiprocessing.Event()
-        cls.process_output = multiprocessing.Queue()
-        cls.process_data = multiprocessing.Queue()                        
-        cls.output_file = open(output_filename, 'w') if output_filename is not None else None
+        self.config_filename = config_filename
+        self.num_workers = num_workers
+        self.num_processes = num_processes
+        self.output_filename = output_filename
+        self.output_format = output_format
+        
+        self.start_load_test = multiprocessing.Event()
+        self.interrupted = multiprocessing.Event()
+        self.process_output = multiprocessing.Queue()
+        self.process_data = multiprocessing.Queue()                        
+        self.output_file = open(output_filename, 'w') if output_filename is not None else None
+        self.interrupts = 0
                 
-        with open(cls.config_filename) as config_file:
-            cls.config = json.load(config_file)  
+        with open(self.config_filename) as config_file:
+            self.config = json.load(config_file)  
+                    
+        # Ensure we can cleanly shut down
+        def signal_handler(signal, frame):
+            self.interrupted.set()                        
+            self.interrupts += 1       
+            if self.interrupts >= MAX_INTERRUPTS:
+                # Panic mode in case everything is hung.
+                if self.output_file is not None:
+                    self.output_file.close()  
+                    sys.exit(0)
+                             
+        signal.signal(signal.SIGINT, signal_handler)
+       
                
-    @classmethod 
-    def start(cls): 
+    def start(self): 
         # Output configuration info.                                                                      
-        print(json.dumps(cls.config))
-        if cls.output_file is not None and cls.output_format is None:
-            cls.output_file.write(json.dumps(cls.config) + '\n')
+        print(json.dumps(self.config))
+        if self.output_file is not None and self.output_format is None:
+            self.output_file.write(json.dumps(self.config) + '\n')
                 
         # Spawn load test processes.
-        processes = [ Dispatcher(num, cls.start_load_test, cls.process_output, cls.process_data, cls.config,
-                                 cls.num_workers // cls.num_processes) for num in range(cls.num_processes) ] 
+        processes = [ Dispatcher(num, self.start_load_test, self.interrupted, self.process_output, self.process_data, self.config,
+                                 self.num_workers // self.num_processes) for num in range(self.num_processes) ] 
         
         # Start each process which will stand by once they've kicked up all their workers.   
         for process in processes:
             process.start()       
-        cls.join_and_output(cls.num_processes,
-                             cls.process_output,
-                             cls.output_file if cls.output_format is None else None)
+        self.join_and_output(self.num_processes,
+                             self.process_output,
+                             self.output_file if self.output_format is None else None)
         
         # Unleash the damage.
-        cls.start_load_test.set()
-        cls.join_and_output(cls.num_processes, 
-                             cls.process_output, 
-                             cls.output_file if cls.output_format is None else None)
+        self.start_load_test.set()
+        self.join_and_output(self.num_processes, 
+                             self.process_output, 
+                             self.output_file if self.output_format is None else None)
         
         # Output CSV from worker data if requested.
-        if cls.output_format == 'csv':
-            cls.output_csv(cls.process_data, cls.output_file)
+        if self.output_format == 'csv':
+            self.output_csv(self.process_data, self.output_file)
                 
         # Close output file if specified.
-        if cls.output_file is not None:
-            cls.output_file.close()        
+        if self.output_file is not None:
+            self.output_file.close()        
 
-    @classmethod
-    def join_and_output(cls, num, queue, output_file):
+
+    def join_and_output(self, num, input_queue, output_file):
         """
         Joins on a queue while directing output from it. The queue is assumed to be filled by 'num' threads / processes
         and interprets 'None' in the queue as a signal from one of the threads / processes that it has completed. Will
         print to standard output and optionally write to 'out_file' file object if it is not 'None'.
         """
         count = num
-        while count:
-            output = queue.get(block=True)
+        while count:          
+            output = input_queue.get(block=True)
             if output is None:
-                count -= 1
+                count -= 1                
             else:
                 print(output)
                 if output_file is not None:
                     output_file.write(output + "\n")
     
-    @classmethod
-    def output_csv(cls, queue, output_file):
+    
+    def output_csv(self, input_queue, output_file):
         """
         Outputs data from a queue to a file object in CSV format. Each queue entry is expected to contain a list of
         primitives.     
         """
-        while not queue.empty():
-            data = queue.get()
+        while not input_queue.empty():
+            data = input_queue.get()
             output_file.write(str(data[0]))
             for element in data[1:]:
                 output_file.write(',' + str(element))
             output_file.write('\n')
-        
+            
 class Dispatcher(multiprocessing.Process):
     """
     Process which controls execution of Requester threads.
     """
     
-    def __init__(self, process_id, ready, output, data, config, num_workers, *args, **kwargs):
+    def __init__(self, process_id, ready, interrupted, output, data, config, num_workers, *args, **kwargs):
         multiprocessing.Process.__init__(self, *args, **kwargs)
         self.process_id = process_id
         self.ready = ready
+        self.interrupted = interrupted
         self.output = output
         self.data = data
         self.config = config
@@ -134,6 +161,8 @@ class Dispatcher(multiprocessing.Process):
         workers = [ Requester(num, start_workers, threads_completed, self.config)
                     for num in range(self.num_workers)]
         for i in range(self.num_workers):
+            if self.check_interrupt():
+                break            
             workers[i].start()
             self.output.put("Process {} initialized worker {}".format(self.process_id, i))
         
@@ -151,6 +180,9 @@ class Dispatcher(multiprocessing.Process):
         # Join on the queue of completed worker statuses while aggregating the data from them in order.
         worker_count = self.num_workers
         while (worker_count):
+            if self.check_interrupt():
+                break
+            
             try:
                 worker_id = threads_completed.get()                
                 worker_count -= 1
@@ -162,10 +194,16 @@ class Dispatcher(multiprocessing.Process):
                 self.output.put('Process {}, {}'.format(self.process_id, workers[worker_id].info))
                 self.data.put(workers[worker_id].data)
                 
-            except queue.Empty:                
+            except queue.Empty:          
                 time.sleep(THREAD_SLEEP)
                 
         self.output.put(None)
+        
+    def check_interrupt(self):
+        if self.interrupted.is_set():
+            self.output.put("Got interrupt in process {}.".format(self.process_id))
+            return True
+        return False
                   
 class Requester(threading.Thread):
     """
@@ -263,9 +301,8 @@ if __name__ == '__main__':
     if not (os.path.isfile(args.config)):
         sys.stderr.write("Configuration file '{}' not found.\n\n".format(args.output))
 
-    Application.init(args.config,
-                     args.workers if args.workers else NUM_WORKERS,
-                     args.processes if args.processes else NUM_PROCESSES,
-                     args.output if args.output else None,
-                     args.format.lower() if args.format else None)
-    Application.start()
+    Application(args.config,
+                args.workers if args.workers else NUM_WORKERS,
+                args.processes if args.processes else NUM_PROCESSES,
+                args.output if args.output else None,
+                args.format.lower() if args.format else None).start()
