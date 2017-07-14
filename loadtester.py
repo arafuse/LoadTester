@@ -27,6 +27,7 @@ import requests
 # Application defaults.
 NUM_WORKERS = 5000                               # Total number test workers
 NUM_PROCESSES = multiprocessing.cpu_count() + 1  # Number of processes (cores) to utilize
+RAMP_UP_SECS = 0                                 # Ramp-up time in seconds (default instant)
 THREAD_SLEEP = 0.1                               # Default time to sleep a thread (eg. during polling)
 MAX_INTERRUPTS = 5                               # Max Ctrl+C / SIGINTs before hard exit
 
@@ -45,12 +46,13 @@ class Application(Singleton):
     """
     Main application logic.
     """
-    def __init__(self, config_filename, num_workers, num_processes, output_filename, output_format):
+    def __init__(self, config_filename, num_workers, num_processes, ramp_up_time, output_filename, output_format):
         Singleton.__init__(self)
         
         self.config_filename = config_filename
         self.num_workers = num_workers
         self.num_processes = num_processes
+        self.ramp_up_time = ramp_up_time
         self.output_filename = output_filename
         self.output_format = output_format
         
@@ -84,8 +86,9 @@ class Application(Singleton):
             self.output_file.write(json.dumps(self.config) + '\n')
                 
         # Spawn load test processes.
-        processes = [ Dispatcher(num, self.start_load_test, self.interrupted, self.process_output, self.process_data, self.config,
-                                 self.num_workers // self.num_processes) for num in range(self.num_processes) ] 
+        processes = [ Dispatcher(num, self.start_load_test, self.interrupted, self.process_output, self.process_data,
+                                 self.config, self.num_workers // self.num_processes, self.ramp_up_time)
+                      for num in range(self.num_processes) ] 
         
         # Start each process which will stand by once they've kicked up all their workers.   
         for process in processes:
@@ -101,7 +104,7 @@ class Application(Singleton):
                              self.output_file if self.output_format is None else None)
         
         # Output CSV from worker data if requested.
-        if self.output_format == 'csv':
+        if self.output_format == 'csv' and self.output_file is not None:
             self.output_csv(self.process_data, self.output_file)
                 
         # Close output file if specified.
@@ -143,7 +146,8 @@ class Dispatcher(multiprocessing.Process):
     Process which controls execution of Requester threads.
     """
     
-    def __init__(self, process_id, ready, interrupted, output, data, config, num_workers, *args, **kwargs):
+    def __init__(self, process_id, ready, interrupted, output, data, config, num_workers, ramp_up_time, 
+                 *args, **kwargs):
         multiprocessing.Process.__init__(self, *args, **kwargs)
         self.process_id = process_id
         self.ready = ready
@@ -153,12 +157,14 @@ class Dispatcher(multiprocessing.Process):
         self.config = config
         self.num_workers = num_workers
         
+        self.delay = ramp_up_time / self.num_workers
+        
     def run(self):
         threads_completed = queue.Queue()
         
         # Kick off all worker threads, which will wait before making any requests.
         start_workers = threading.Event()
-        workers = [ Requester(num, start_workers, threads_completed, self.config)
+        workers = [ Requester(num, start_workers, threads_completed, self.config, self.delay)
                     for num in range(self.num_workers)]
         for i in range(self.num_workers):
             if self.check_interrupt():
@@ -201,7 +207,8 @@ class Dispatcher(multiprocessing.Process):
         
     def check_interrupt(self):
         if self.interrupted.is_set():
-            self.output.put("Got interrupt in process {}.".format(self.process_id))
+            #sys.stderr.write("Got interrupt in process {}.\n".format(self.process_id))
+            self.output.put("Got interrupt in process {}.\n".format(self.process_id))
             return True
         return False
                   
@@ -210,15 +217,17 @@ class Requester(threading.Thread):
     Thread which handles the request and retry logic for a single load test worker.
     """
     
-    def __init__(self, worker_id, ready, completed, config, *args, **kwargs):
+    def __init__(self, worker_num, ready, completed, config, delay, *args, **kwargs):
         threading.Thread.__init__(self, *args, **kwargs)
-        self.worker_id = worker_id
+        self.worker_num = worker_num
         self.ready = ready
         self.completed = completed
         self.config = config
+        self.delay = delay
+        
         self.status = 0
-        self.info = 'worker {}:'.format(self.worker_id)
-        self.data = [worker_id]
+        self.info = 'worker {}:'.format(self.worker_num)
+        self.data = [worker_num]
         
         # Disable automatic retries because we handle them ourselves.
         self.session = requests.Session()
@@ -244,6 +253,9 @@ class Requester(threading.Thread):
                                                     
         # Wait until the calling thread tells us to begin.
         self.ready.wait()
+        
+        # Delay based on this worker's number with random jitter added.
+        time.sleep(self.delay * self.worker_num + random.uniform(0, self.delay))
         
         # Begin handling the request.
         start_time = time.time()
@@ -284,7 +296,7 @@ class Requester(threading.Thread):
         
         # Clean up and signal completion to the calling thread.
         response.close()        
-        self.completed.put(self.worker_id)    
+        self.completed.put(self.worker_num)    
                                     
 if __name__ == '__main__':
     argParser = argparse.ArgumentParser(description='Quick and dirty load tester for HTTPS REST APIs.')
@@ -293,6 +305,8 @@ if __name__ == '__main__':
                            help="Total number of test workers to spawn (default {}).".format(NUM_WORKERS))
     argParser.add_argument('-p', '--processes', type=int,
                            help="Total number of processes to use (default {}).".format(NUM_PROCESSES))
+    argParser.add_argument('-t', '--time', type=int,
+                           help="Ramp up time in seconds (default {}).".format(RAMP_UP_SECS))
     argParser.add_argument('-o', '--output', type=str,
                            help="Optional output file.")
     argParser.add_argument('-f', '--format', type=str,
@@ -305,5 +319,6 @@ if __name__ == '__main__':
     Application(args.config,
                 args.workers if args.workers else NUM_WORKERS,
                 args.processes if args.processes else NUM_PROCESSES,
+                args.time if args.time else RAMP_UP_SECS,
                 args.output if args.output else None,
                 args.format.lower() if args.format else None).start()

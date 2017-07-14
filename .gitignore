@@ -3,6 +3,6 @@
 .settings/
 loadtester
 loadtester.c
-output.txt
 notes.txt
+output/
 lib/
