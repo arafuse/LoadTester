@@ -30,9 +30,26 @@ NUM_PROCESSES = multiprocessing.cpu_count() + 1  # Number of processes (cores) t
 RAMP_UP_SECS = 0                                 # Ramp-up time in seconds (default instant)
 THREAD_SLEEP = 0.1                               # Default time to sleep a thread (eg. during polling)
 MAX_INTERRUPTS = 5                               # Max Ctrl+C / SIGINTs before hard exit
+STACK_SIZE = 32768                               # Stack size for new threads
+REQUESTS_DEBUG = False                           # Dump ugly debug output from requests
 
 # Global timer used by each process.
+# FIXME: This will be slightly off for each multiprocess, use multiprocessing.Value() to pass it around.
 global_timer = time.time()
+
+# Set stack size for new threads.
+threading.stack_size(STACK_SIZE)
+
+# Configure request debugging.
+if REQUESTS_DEBUG:
+    import http.client as http_client
+    import logging
+    http_client.HTTPConnection.debuglevel = 1
+    logging.basicConfig()
+    logging.getLogger().setLevel(logging.DEBUG)
+    requests_log = logging.getLogger("requests.packages.urllib3")
+    requests_log.setLevel(logging.DEBUG)
+    requests_log.propagate = True
 
 class Singleton():
     """
@@ -207,7 +224,6 @@ class Dispatcher(multiprocessing.Process):
         
     def check_interrupt(self):
         if self.interrupted.is_set():
-            #sys.stderr.write("Got interrupt in process {}.\n".format(self.process_id))
             self.output.put("Got interrupt in process {}.\n".format(self.process_id))
             return True
         return False
@@ -238,6 +254,7 @@ class Requester(threading.Thread):
         method = self.config['method']
         url = self.config['url']
         params = self.config['params'].copy()  # Copy to avoid repeatedly clobbering parameters
+        body = self.config['body'].copy()
         randomize = self.config['randomize']
         retries = 0 
         
@@ -245,11 +262,41 @@ class Requester(threading.Thread):
         # where each member gets the same random index, so they can be linked (eg. usernames with passwords). This
         # means the value list for parameters in the same group must be the same size.
         if randomize:
-            for group in randomize:            
-                index = random.randint(0, len(params[group[0]]) - 1)
-                for entry in group:                    
-                    params[entry] = params[entry][index]
-                    self.info += "\n  Selected value '{}' for randomized parameter '{}'".format(params[entry], entry)
+            for group in randomize:         
+                try:   
+                    index = random.randint(0, len(params[group[0]]) - 1)  # Param is in query
+                except KeyError:
+                    index = random.randint(0, len(body[group[0]]) - 1)    # Param is in body
+                    
+                for entry in group:
+                    try:
+                        params[entry] = params[entry][index]              # Param is in query
+                        self.info += ("\n  Selected value '{}' for randomized parameter '{}'"
+                                      .format(params[entry], entry))
+
+                    except KeyError:                    
+                        try:
+                            body[entry] = body[entry][index]              # Param is in body
+                            self.info += ("\n  Selected value '{}' for randomized parameter '{}'"
+                                          .format(body[entry], entry))
+
+                        except KeyError:
+                            self.info += "\n  Randomized parameter '{}' not found.".format(entry)
+                        
+                            
+        # Replace path params with their values and remove them as query params.
+        path_params = []
+        for param in params:
+            if url.find('{' + param + '}') != -1:
+                path_params.append(param)
+        url = url.format(**params)
+        for param in path_params:
+            del params[param]
+        
+        # 
+        self.info += "\n  Using URL: {}.".format(url)
+        self.info += "\n  Using query params: {}.".format(params)
+        self.info += "\n  Using body: {}.".format(body)
                                                     
         # Wait until the calling thread tells us to begin.
         self.ready.wait()
@@ -265,8 +312,8 @@ class Requester(threading.Thread):
                                          
         while self.status != 200:
             try:                            
-                response = self.session.request(method, url, timeout=self.config['timeout'], params=params, 
-                                                stream=True)
+                response = self.session.request(method, url, timeout=self.config['timeout'],
+                                                params=params, json=body, stream=True)
                 self.status = response.status_code 
                 
                 if (self.status == 200):
